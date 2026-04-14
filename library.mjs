@@ -273,6 +273,42 @@ app.post("/add-books", async(req,res) => {
 
 });
 
+async function runSqlQuery(query, params) {
+    let result = {};
+
+    try {
+        let request = new sql.Request();
+
+        
+
+        result.success = true;
+    } catch (err) {
+        result.success = false;
+        result.message = err.message;
+    }
+
+
+}
+
+app.post("/add-existing-books", async(req,res) => {
+
+    let query = `
+        update amounts
+        set total = total + @added
+        output inserted.isbn, @added as added, inserted.total
+        where isbn = @isbn
+        `;
+
+    let result = await (new sql.Request())
+            .input("isbn", req.body.isbn)
+            .input("added", req.body.added)
+            .query(query);
+    
+    let output = result.recordset[0];
+
+    res.status(200).json(output);
+});
+
 app.post("/search", async (req, res) => {
     let query = `
         select isbn, name_a, title
@@ -282,8 +318,8 @@ app.post("/search", async (req, res) => {
 
     let request = new sql.Request();
     let result = await request
-        .input("author", req.body.author)
-        .input("title", req.body.title)
+        .input("author", `%${req.body.author}%`)
+        .input("title", `%${req.body.title}%`)
         .query(query);
     
     res.status(200).json(result.recordset);
