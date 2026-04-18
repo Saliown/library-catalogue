@@ -3,8 +3,13 @@
 import sql from "mssql";
 
 import express from "express";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+
 const app = express();
 app.use(express.json());
+
+(await import("dotenv")).config();
 
 // Database configuration
 const config = {
@@ -160,9 +165,11 @@ async function addUser(args) {
 app.post("/register", async(req, res) => { 
     const {name, password, email} = req.body;
 
+    let passwordHash = await bcrypt.hash(password, 10);
+
     let query = `insert into USERS(NAME_U, PASSWORD, EMAIL, REGIST_DATE)
         output inserted.*
-        values ('${name}', '${password}', '${email}', getdate());`;
+        values ('${name}', '${passwordHash}', '${email}', getdate());`;
 
     try {
         await connect();
@@ -197,7 +204,7 @@ else {
     app.listen(3000, () => console.log("ЖДУ"));
 }
 
-app.post("/login", async (req, res) => {
+app.post("/old-login", async (req, res) => {
     const { email, password } = req.body;
 
     let query = `
@@ -269,6 +276,9 @@ app.post("/add-books", async(req,res) => {
     
     let total = result.recordset[0].total;
 
+    // пока не протестировали:
+    await runSqlQuery(`INSERT INTO DEADLINES (ID_BOOK) VALUES (@isbn)`, {isbn});
+
     res.status(200).json({isbn, total});
 
 });
@@ -278,16 +288,21 @@ async function runSqlQuery(query, params) {
 
     try {
         let request = new sql.Request();
-
         
-
+        for (let key of Object.keys(params))
+            request = request.input(key, params[key]);
+        
+        const sqlResult = await request.query(query);
+        
         result.success = true;
+        result.data = sqlResult.recordset;
+        result.recordset = result.data;
     } catch (err) {
         result.success = false;
         result.message = err.message;
     }
-
-
+    
+    return result;
 }
 
 app.post("/add-existing-books", async(req,res) => {
@@ -324,3 +339,116 @@ app.post("/search", async (req, res) => {
     
     res.status(200).json(result.recordset);
 });
+
+app.post("/booking", auth, async (req, res) => {
+    const { bookId } = req.body;
+    const userId = req.user.id;
+
+    try {
+        const request = new sql.Request();
+
+        // проверка доступности книги
+        request.input("bookId", sql.VarChar, bookId);
+
+        const check = await request.query(`
+            SELECT * FROM AMOUNTS
+            WHERE BOOK_ID = @bookId
+        `);
+
+        if (check.recordset.length === 0) {
+            return res.status(404).json({ message: "Книга не найдена" });
+        }
+
+        const book = check.recordset[0];
+
+        if (book.TOTAL - book.TAKEN - book.BOOKED <= 0) {
+            return res.status(400).json({ message: "Нет доступных книг" });
+        }
+
+        let deadline = await runSqlQuery(`
+            SELECT FOR_BOOKING
+            FROM DEADLINES
+            WHERE BOOK_ID = @bookId
+        `, {bookId} );
+
+        deadline = deadline.recordset[0].FOR_BOOKING;
+
+        // создаем бронирование
+        const request2 = new sql.Request();
+        request2.input("userId", sql.Int, userId);
+        request2.input("bookId", sql.VarChar, bookId);
+        request2.input("deadline", sql.Int, deadline);
+
+        await request2.query(`
+            INSERT INTO BOOKING(USER_ID, BOOK_ID, START_DATE, END_DATE)
+            VALUES (@userId, @bookId, GETDATE(), GETDATE() + @deadline)
+        `);
+
+        // увеличиваем BOOKED
+        const request3 = new sql.Request();
+        request3.input("bookId", sql.VarChar, bookId);
+
+        await request3.query(`
+            UPDATE AMOUNTS
+            SET BOOKED = BOOKED + 1
+            WHERE BOOK_ID = @bookId
+        `);
+
+        res.json({ message: "Книга забронирована" });
+
+    } catch (e) {
+        res.status(500).json({ message: e.message, stack: e.stack });
+    }
+});
+
+
+app.post('/login', async (req, res) => {
+    const { email, password } = req.body;
+
+    try {
+        const pool = await sql.connect(config);
+        const result = await pool.request()
+            .input('email', sql.VarChar, email)
+            .query('SELECT * FROM Users WHERE email = @email and is_blocked = 0');
+
+        const user = result.recordset[0];
+        
+        if (!user) return res.status(404).json({ message: "Не найден" });
+
+        if (user.isBlocked)
+            return res.status(403).json({ message: "Ваш аккаунт заблокирован" });
+        
+        const match = await bcrypt.compare(password, user.PASSWORD);
+        if (!match) return res.status(401).json({ message: "Неверный пароль" });
+
+        const token = jwt.sign(
+            { id: user.id, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: '1h' }
+        );
+
+        res.json({ token });
+
+    } catch (err) {
+        res.status(500).json({ message: err.message });
+    }
+});
+
+// Middleware
+function auth(req, res, next) {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) return res.sendStatus(401);
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+}
+
+function admin(req, res, next) {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ message: "Нет доступа" });
+    }
+    next();
+}
